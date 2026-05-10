@@ -1,0 +1,12 @@
+# Binaries
+qos-proxy/qos-proxy
+qos-proxy/qos-proxy-amd64
+qos-proxy/qos-proxy-arm64
+
+# Homebrew tap (local copy)
+homebrew-qos-guard/
+
+# OS files
+.DS_Store
+*.swp
+*~

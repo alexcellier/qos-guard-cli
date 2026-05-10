@@ -1,0 +1,921 @@
+#!/usr/bin/env bash
+#
+# qos-guard — Per-process bandwidth limiting CLI for macOS
+# Uses a proxy-based approach with qos-proxy for rate limiting.
+#
+# Usage: qos-guard [options] <bandwidth_limit> <command> [args...]
+#
+# Examples:
+#   qos-guard 50% curl https://example.com
+#   qos-guard 10mbps wget large-file.tar
+#   qos-guard 500kbps ollama pull biglm
+#   qos-guard --restore
+#   qos-guard --verbose 50% curl https://example.com
+#   qos-guard --dry-run 50% curl https://example.com
+#   qos-guard --interface en0 50% curl https://example.com
+#   qos-guard --proxy-port 8080 50% curl https://example.com
+#   qos-guard --udp-interface en0 50% curl https://example.com
+#
+
+set -euo pipefail
+
+# Version
+readonly VERSION="1.0.0"
+
+# Internal state
+PROXY_PID=""
+PROXY_PORT=""
+TARGET_PID=""
+INTERFACE=""
+DETECTED_BW=""
+LIMIT_KBPS=""
+UDP_INTERFACE=""  # Interface for UDP limiting
+UDP_RULE_APPLIED=false  # Track if UDP rule was applied
+
+# Phase 2 flags
+VERBOSE=false
+DRY_RUN=false
+SPECIFIED_INTERFACE=""
+CUSTOM_PROXY_PORT=""
+
+# Cleanup tracking
+CLEANUP_DONE=false
+
+# ============================================================
+# Help and version
+# ============================================================
+
+show_help() {
+    cat <<'EOF'
+Usage: qos-guard [options] <bandwidth_limit> <command> [args...]
+
+Proxy-based bandwidth limiting for macOS using qos-proxy.
+
+Arguments:
+  bandwidth_limit    Bandwidth limit (e.g., 50%, 10mbps, 500kbps)
+  command            Command to execute
+  args               Arguments for the command
+
+Options:
+  --restore              Clean up any stale proxy processes
+  --help                 Show this help message
+  --version              Show version
+  --verbose, -v          Enable verbose output with timestamps
+  --dry-run, -n          Preview actions without executing
+  --interface, -i IFACE  Specify network interface (e.g., en0)
+  --proxy-port PORT      Use a specific proxy port (for debugging)
+  --udp-interface, -u IFACE  Interface for UDP traffic limiting (interface-level)
+                             Note: UDP limiting applies to ALL traffic on the interface
+
+Examples:
+  qos-guard 50% curl https://example.com
+  qos-guard 10mbps wget large-file.tar
+  qos-guard 500kbps ollama pull biglm
+  qos-guard --restore
+  qos-guard --verbose 50% curl https://example.com
+  qos-guard --dry-run 50% curl https://example.com
+  qos-guard --interface en0 50% curl https://example.com
+  qos-guard --proxy-port 8080 50% curl https://example.com
+  qos-guard --udp-interface en0 50% curl https://example.com
+
+Note: qos-guard uses a proxy-based approach for bandwidth limiting.
+It starts a local proxy and sets HTTP_PROXY/HTTPS_PROXY/all_proxy
+environment variables for the target command.
+
+Proxy binary locations (searched in order):
+  ./qos-proxy/qos-proxy
+  /usr/local/bin/qos-proxy
+  $HOME/.local/bin/qos-proxy
+  $PATH
+EOF
+}
+
+show_version() {
+    echo "qos-guard v${VERSION}"
+}
+
+# ============================================================
+# Logging (Phase 2: verbose logging with timestamps)
+# ============================================================
+
+log_error() {
+    echo "Error: $*" >&2
+}
+
+log_warn() {
+    echo "Warning: $*" >&2
+}
+
+log_verbose() {
+    if [ "$VERBOSE" = true ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2
+    fi
+}
+
+# ============================================================
+# Signal handling (Phase 2: US-8)
+# ============================================================
+
+cleanup_on_signal() {
+    if [ "$CLEANUP_DONE" = true ]; then
+        return
+    fi
+    CLEANUP_DONE=true
+    echo "Interrupted. Cleaning up proxy..." >&2
+    cleanup_proxy
+    echo "Proxy cleaned up." >&2
+    exit 130  # Standard exit code for SIGINT
+}
+
+setup_signal_traps() {
+    trap cleanup_on_signal SIGINT SIGTERM
+}
+
+# ============================================================
+# Proxy binary discovery
+# ============================================================
+
+find_proxy_binary() {
+    # Check relative to script location
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [[ -x "${script_dir}/qos-proxy/qos-proxy" ]]; then
+        echo "${script_dir}/qos-proxy/qos-proxy"
+        return 0
+    fi
+
+    # Check /usr/local/bin
+    if [[ -x "/usr/local/bin/qos-proxy" ]]; then
+        echo "/usr/local/bin/qos-proxy"
+        return 0
+    fi
+
+    # Check $HOME/.local/bin
+    local home_proxy="$HOME/.local/bin/qos-proxy"
+    if [[ -x "$home_proxy" ]]; then
+        echo "$home_proxy"
+        return 0
+    fi
+
+    # Check $PATH
+    local found
+    found="$(command -v qos-proxy 2>/dev/null || true)"
+    if [[ -n "$found" ]]; then
+        echo "$found"
+        return 0
+    fi
+
+    return 1
+}
+
+# ============================================================
+# Proxy management functions
+# ============================================================
+
+start_proxy() {
+    local limit="$1"
+    local target_pid="$2"
+
+    # Find proxy binary
+    local proxy_binary
+    proxy_binary="$(find_proxy_binary)" || {
+        log_error "qos-proxy binary not found. Please install it or ensure it's in your PATH."
+        return 1
+    }
+
+    log_verbose "Found proxy binary: ${proxy_binary}"
+
+    # Determine bind address
+    local bind_addr="127.0.0.1:0"
+    if [[ -n "$CUSTOM_PROXY_PORT" ]]; then
+        bind_addr="127.0.0.1:${CUSTOM_PROXY_PORT}"
+        log_verbose "Using custom proxy port: ${CUSTOM_PROXY_PORT}"
+    else
+        log_verbose "Using random available port (0)"
+    fi
+
+    # Start proxy in background with stderr captured to temp file
+    local tmpfile
+    tmpfile="$(mktemp)"
+    
+    log_verbose "Starting proxy: ${proxy_binary} -b ${bind_addr} -l ${limit} -p all --pid ${target_pid}"
+    "${proxy_binary}" -b "${bind_addr}" -l "${limit}" -p all --pid "${target_pid}" 2>"${tmpfile}" &
+    PROXY_PID=$!
+
+    # Wait for proxy to initialize
+    sleep 1
+
+    # Read port from temp file
+    PROXY_PORT=$(grep -oE 'qos-proxy started on [0-9.]+:[0-9]+' "${tmpfile}" | grep -oE '[0-9]+$' || true)
+
+    if [[ -z "$PROXY_PORT" ]]; then
+        # Try alternative format: check for "HTTP proxy listening on"
+        PROXY_PORT=$(grep -oE 'HTTP proxy listening on [0-9.]+:[0-9]+' "${tmpfile}" | grep -oE '[0-9]+$' || true)
+    fi
+
+    rm -f "${tmpfile}"
+
+    if [[ -z "$PROXY_PORT" ]]; then
+        log_error "Failed to get proxy port"
+        kill "${PROXY_PID}" 2>/dev/null || true
+        PROXY_PID=""
+        return 1
+    fi
+
+    # Verify proxy is healthy
+    if ! check_proxy_health; then
+        log_error "Proxy health check failed"
+        kill "${PROXY_PID}" 2>/dev/null || true
+        PROXY_PID=""
+        PROXY_PORT=""
+        return 1
+    fi
+
+    # Wait for proxy to be listening on the port
+    if ! wait_for_proxy 5; then
+        log_error "Proxy failed to start on port ${PROXY_PORT}"
+        kill "${PROXY_PID}" 2>/dev/null || true
+        PROXY_PID=""
+        PROXY_PORT=""
+        return 1
+    fi
+
+    log_verbose "Proxy started on port ${PROXY_PORT} (PID: ${PROXY_PID})"
+    return 0
+}
+
+stop_proxy() {
+    if [[ -n "${PROXY_PID}" ]] && kill -0 "${PROXY_PID}" 2>/dev/null; then
+        log_verbose "Stopping proxy (PID: ${PROXY_PID})"
+        kill -TERM "${PROXY_PID}" 2>/dev/null || true
+        wait "${PROXY_PID}" 2>/dev/null || true
+        PROXY_PID=""
+        PROXY_PORT=""
+        log_verbose "Proxy stopped"
+    fi
+}
+
+cleanup_proxy() {
+    if [[ "$CLEANUP_DONE" = true ]]; then
+        return
+    fi
+    CLEANUP_DONE=true
+
+    stop_proxy
+}
+
+# ============================================================
+# UDP interface-level limiting (Phase 5)
+# ============================================================
+
+apply_udp_limit() {
+    local interface="$1"
+    local limit="$2"
+    
+    if [ -z "${interface}" ] || [ -z "${limit}" ]; then
+        log_error "UDP interface and limit are required"
+        return 1
+    fi
+    
+    # Check for sudo (required for pfctl)
+    if [[ "$(id -u)" -ne 0 ]]; then
+        log_warn "UDP limiting requires sudo. Skipping UDP limiting."
+        return 0  # Don't fail, just warn
+    fi
+    
+    # Create a unique pipe ID
+    local pipe_id=$((RANDOM % 9000 + 1000))
+    local anchor_name="qosguard/udp_limit"
+    
+    # Flush any existing rules in the anchor
+    pfctl -a "${anchor_name}" -F all 2>/dev/null || true
+    pfctl -a "qosguard" -F all 2>/dev/null || true
+    
+    # Create the anchor
+    pfctl -a "${anchor_name}" -N anchor 2>/dev/null || true
+    
+    # Create dummynet pipe
+    pfctl -a "qosguard" -p pipe "qosguard-udp-${pipe_id}" config bw "${limit}" 2>/dev/null || {
+        log_warn "Failed to create dummynet pipe"
+        return 1
+    }
+    
+    # Create temp file for anchor rules
+    local anchor_file="/tmp/qosguard-udp-anchor"
+    
+    # Write anchor rules to temp file
+    cat > "${anchor_file}" <<PFEOF
+# qosguard UDP anchor - dummynet pipe for UDP limiting on ${interface}
+dummynet out on ${interface} proto udp pipe "qosguard-udp-${pipe_id}"
+PFEOF
+    
+    # Apply the anchor rules
+    pfctl -a "qosguard" -f "${anchor_file}" 2>/dev/null || {
+        log_warn "Failed to apply pf UDP rules"
+        rm -f "${anchor_file}"
+        return 1
+    }
+    
+    UDP_INTERFACE="${interface}"
+    UDP_PIPE_ID="${pipe_id}"
+    UDP_RULE_APPLIED=true
+    log_verbose "UDP limiting applied on ${interface} with ${limit} (pipe qosguard-udp-${pipe_id})"
+    rm -f "${anchor_file}"
+    return 0
+}
+
+# Remove interface-level UDP limiting
+remove_udp_limit() {
+    if [ "${UDP_RULE_APPLIED}" != "true" ]; then
+        return
+    fi
+    
+    local anchor_name="qosguard/udp_limit"
+    
+    # Flush pf anchor rules
+    pfctl -a "${anchor_name}" -F all 2>/dev/null || true
+    pfctl -a "qosguard" -F all 2>/dev/null || true
+    
+    # Remove temp file
+    rm -f /tmp/qosguard-udp-anchor
+    
+    UDP_RULE_APPLIED=false
+    log_info "UDP limiting removed"
+}
+
+set_proxy_env() {
+    if [[ -z "${PROXY_PORT}" ]]; then
+        log_error "Proxy port not set"
+        return 1
+    fi
+
+    local proxy_url="http://127.0.0.1:${PROXY_PORT}"
+    export HTTPS_PROXY="${proxy_url}"
+    export HTTP_PROXY="${proxy_url}"
+    export all_proxy="${proxy_url}"
+    log_verbose "Set proxy env vars: HTTPS_PROXY=${proxy_url}, HTTP_PROXY=${proxy_url}, all_proxy=${proxy_url}"
+    return 0
+}
+
+# ============================================================
+# 1.3  Bandwidth input validation  (US-15)
+# ============================================================
+
+validate_bandwidth() {
+    local input="$1"
+
+    # Empty check
+    if [[ -z "$input" ]]; then
+        log_error "Bandwidth value is required. Use examples: 50%, 10mbps, 500kbps"
+        return 1
+    fi
+
+    # Trim leading/trailing whitespace
+    input="$(echo "$input" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+    # Check for negative values
+    if [[ "$input" =~ ^- ]]; then
+        log_error "Bandwidth value cannot be negative: '${input}'"
+        return 1
+    fi
+
+    # Percentage format: e.g., 50%, 33.5%
+    if [[ "$input" =~ ^[0-9]+(\.[0-9]+)?%$ ]]; then
+        local pct="${input%%%}"
+        # Check range 0-100
+        if (( $(echo "$pct <= 0" | bc -l) )); then
+            log_error "Bandwidth percentage must be greater than 0: '${input}'"
+            return 1
+        fi
+        if (( $(echo "$pct > 100" | bc -l) )); then
+            log_error "Bandwidth percentage cannot exceed 100: '${input}'"
+            return 1
+        fi
+        return 0
+    fi
+
+    # Absolute format: e.g., 10mbps, 500kbps (case-insensitive)
+    if [[ "$input" =~ ^[0-9]+(\.[0-9]+)?[Mm][Bb][Pp][Ss]$ ]]; then
+        return 0
+    fi
+
+    if [[ "$input" =~ ^[0-9]+(\.[0-9]+)?[Kk][Bb][Pp][Ss]$ ]]; then
+        return 0
+    fi
+
+    # No suffix — invalid
+    if [[ ! "$input" =~ [MmKk][Bb][Pp][Ss]$ && ! "$input" =~ \%$ ]]; then
+        log_error "Invalid bandwidth format: '${input}'. Use examples: 50%, 10mbps, 500kbps"
+        return 1
+    fi
+
+    log_error "Invalid bandwidth format: '${input}'. Use examples: 50%, 10mbps, 500kbps"
+    return 1
+}
+
+# ============================================================
+# 1.4  Network interface detection  (US-4)
+# ============================================================
+
+detect_interface() {
+    # If user specified an interface, validate it
+    if [[ -n "$SPECIFIED_INTERFACE" ]]; then
+        INTERFACE="$SPECIFIED_INTERFACE"
+        # Validate interface exists
+        if ! ifconfig "$INTERFACE" >/dev/null 2>&1; then
+            log_error "Interface '${INTERFACE}' not found."
+            log_error "Available interfaces:"
+            ifconfig 2>/dev/null | grep '^en' | awk '{print "  " $1}'
+            return 1
+        fi
+        # Check if interface is up/active
+        if ! ifconfig "$INTERFACE" 2>/dev/null | grep -q "status: active"; then
+            log_warn "Interface '${INTERFACE}' is not active."
+            log_warn "Use --interface to specify an active interface."
+        fi
+        log_verbose "Using specified interface: ${INTERFACE}"
+        return 0
+    fi
+
+    # Use `route get default` to find the default route interface
+    local route_output
+    route_output="$(route get default 2>/dev/null | grep -i 'interface:' | awk -F': ' '{print $2}' | tr -d '[:space:]')"
+
+    if [[ -n "$route_output" ]]; then
+        INTERFACE="$route_output"
+        return 0
+    fi
+
+    # Fallback: try netstat
+    route_output="$(netstat -rn 2>/dev/null | grep '^default' | head -1 | awk '{print $NF}')"
+    if [[ -n "$route_output" ]]; then
+        INTERFACE="$route_output"
+        return 0
+    fi
+
+    # Last resort: try common interfaces
+    for iface in en0 en1 en2 en3; do
+        if ifconfig "$iface" >/dev/null 2>&1; then
+            INTERFACE="$iface"
+            log_warn "Could not detect default interface; using ${INTERFACE}"
+            return 0
+        fi
+    done
+
+    log_error "Could not detect a network interface. Is your network connected?"
+    return 1
+}
+
+# ============================================================
+# 1.4 (cont.)  Detect interface bandwidth  (US-4)
+# ============================================================
+
+detect_bandwidth() {
+    # Try to get bandwidth from ifconfig
+    local bw_output
+    bw_output="$(ifconfig "$INTERFACE" 2>/dev/null | grep -E 'media:.*<' | grep -oE '[0-9]+[[:space:]]*[GM]bps' | head -1 | sed -E 's/[[:space:]]*/ /g')"
+
+    if [[ -n "$bw_output" ]]; then
+        # Extract numeric value and unit
+        local number unit
+        number="$(echo "$bw_output" | sed 's/[^0-9.]//g')"
+        unit="$(echo "$bw_output" | grep -oE '[GM]bps' | head -1)"
+
+        case "$unit" in
+            Gbps)
+                DETECTED_BW="$(echo "$number * 1000000" | bc -l | sed 's/\..*$//')"
+                ;;
+            Mbps)
+                DETECTED_BW="$(echo "$number * 1000" | bc -l | sed 's/\..*$//')"
+                ;;
+        esac
+        log_verbose "Detected interface: ${INTERFACE} (${unit})"
+        log_verbose "Detected bandwidth: ${DETECTED_BW} Mbps"
+        return 0
+    fi
+
+    # Fallback: no speed info — warn and use 100 Mbps
+    log_warn "Could not detect bandwidth for ${INTERFACE}; defaulting to 100 Mbps"
+    DETECTED_BW="100000"
+    return 0
+}
+
+# ============================================================
+# 1.5  Percentage-to-kbps conversion  (US-5)
+# ============================================================
+
+convert_to_kbps() {
+    local input="$1"
+
+    # Percentage
+    if [[ "$input" =~ ^([0-9]+(\.[0-9]+)?)%$ ]]; then
+        local pct="${input%%%}"
+        if [[ -z "$DETECTED_BW" ]]; then
+            log_error "Bandwidth not detected; cannot calculate percentage"
+            return 1
+        fi
+        LIMIT_KBPS="$(echo "$DETECTED_BW * $pct / 100" | bc -l | sed 's/\..*$//')"
+        log_verbose "Calculated limit (${input}): ${LIMIT_KBPS} kbps (of ${DETECTED_BW} Mbps)"
+        return 0
+    fi
+
+    # Absolute mbps
+    if [[ "$input" =~ ^([0-9]+(\.[0-9]+)?)[Mm][Bb][Pp][Ss]$ ]]; then
+        local val="${input%%[Mm][Bb][Pp][Ss]}"
+        LIMIT_KBPS="$(echo "$val * 1000" | bc -l | sed 's/\..*$//')"
+        log_verbose "Calculated limit (${input}): ${LIMIT_KBPS} kbps"
+        return 0
+    fi
+
+    # Absolute kbps
+    if [[ "$input" =~ ^([0-9]+(\.[0-9]+)?)[Kk][Bb][Pp][Ss]$ ]]; then
+        local val="${input%%[Kk][Bb][Pp][Ss]}"
+        LIMIT_KBPS="$(echo "$val" | bc -l | sed 's/\..*$//')"
+        log_verbose "Calculated limit (${input}): ${LIMIT_KBPS} kbps"
+        return 0
+    fi
+
+    log_error "Failed to convert '${input}' to kbps"
+    return 1
+}
+
+# ============================================================
+# 2.6  Child process tracking (US-3)
+# ============================================================
+
+get_process_group_pids() {
+    local parent_pid=$1
+    # Get all descendants using pgrep
+    local pids="$parent_pid"
+    # Get direct children
+    local children
+    children="$(pgrep -P "$parent_pid" 2>/dev/null || true)"
+    if [[ -n "$children" ]]; then
+        pids="$pids $children"
+        # Recursively get grandchildren
+        for child_pid in $children; do
+            local grandchildren
+            grandchildren="$(pgrep -P "$child_pid" 2>/dev/null || true)"
+            if [[ -n "$grandchildren" ]]; then
+                pids="$pids $grandchildren"
+            fi
+        done
+    fi
+    # Deduplicate and return
+    echo "$pids" | tr ' ' '\n' | sort -un | tr '\n' ' '
+}
+
+# ============================================================
+# Proxy health check (Phase 5: P0)
+# ============================================================
+
+check_proxy_health() {
+    # Check if proxy PID is set and process is running
+    if [[ -z "${PROXY_PID}" ]]; then
+        log_error "Proxy PID is not set"
+        return 1
+    fi
+    
+    if ! kill -0 "${PROXY_PID}" 2>/dev/null; then
+        log_error "Proxy process (PID: ${PROXY_PID}) is not running"
+        return 1
+    fi
+    
+    # Check if proxy port is listening using lsof
+    if [[ -n "${PROXY_PORT}" ]]; then
+        if ! lsof -i ":${PROXY_PORT}" >/dev/null 2>&1; then
+            log_error "Proxy port ${PROXY_PORT} is not listening"
+            return 1
+        fi
+    fi
+    
+    log_verbose "Proxy health check passed (PID: ${PROXY_PID}, port: ${PROXY_PORT})"
+    return 0
+}
+
+# Proxy startup timeout handler (Phase 5: P0)
+wait_for_proxy() {
+    local max_wait="${1:-5}"  # Default 5 seconds
+    local waited=0
+    
+    while [[ $waited -lt $max_wait ]]; do
+        if [[ -n "${PROXY_PORT}" ]] && lsof -i ":${PROXY_PORT}" >/dev/null 2>&1; then
+            log_verbose "Proxy is listening on port ${PROXY_PORT} after ${waited}s"
+            return 0
+        fi
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+    
+    log_error "Proxy failed to start on port ${PROXY_PORT} within ${max_wait}s"
+    return 1
+}
+
+# ============================================================
+# 1.8 (cont.)  Restore (clean all stale qosguard rules)
+# ============================================================
+
+restore_rules() {
+    # Kill any stale qos-proxy processes started by qos-guard
+    local count=0
+    while IFS= read -r pid; do
+        if [[ -n "$pid" ]]; then
+            log_verbose "Killing stale proxy process: ${pid}"
+            kill -TERM "${pid}" 2>/dev/null || true
+            count=$((count + 1))
+        fi
+    done < <(pgrep -f "qos-proxy.*qos-guard" 2>/dev/null || true)
+
+    if [[ "$count" -eq 0 ]]; then
+        echo "No stale proxy processes found."
+    else
+        echo "Cleaned up ${count} stale proxy process(es)."
+    fi
+
+    return 0
+}
+
+# ============================================================
+# 1.7  Command execution with proxy  (US-1, US-2)
+# ============================================================
+
+execute_command() {
+    local bandwidth_limit="$1"
+    shift
+    local command="$1"
+    shift
+    local args=("$@")
+
+    # Validate bandwidth
+    if ! validate_bandwidth "$bandwidth_limit"; then
+        return 1
+    fi
+
+    # Detect network interface
+    if ! detect_interface; then
+        return 1
+    fi
+
+    # Detect interface bandwidth
+    if ! detect_bandwidth; then
+        return 1
+    fi
+
+    # Convert to kbps
+    if ! convert_to_kbps "$bandwidth_limit"; then
+        return 1
+    fi
+
+    # Get target PID (will be set after command execution)
+    # For proxy approach, we don't need PID for filtering
+
+    # Start proxy
+    log_verbose "Starting proxy with limit: ${LIMIT_KBPS} kbps"
+    if ! start_proxy "${LIMIT_KBPS}Kbit" 0; then
+        log_error "Failed to start proxy"
+        return 1
+    fi
+
+    # Set proxy environment variables
+    if ! set_proxy_env; then
+        log_error "Failed to set proxy environment variables"
+        stop_proxy
+        return 1
+    fi
+
+    # Apply UDP limiting if interface specified
+    if [ -n "${UDP_INTERFACE}" ]; then
+        log_verbose "Applying UDP limiting on ${UDP_INTERFACE}..."
+        apply_udp_limit "${UDP_INTERFACE}" "${LIMIT_KBPS}Kbit" || {
+            log_error "Failed to apply UDP limiting"
+            return 1
+        }
+    fi
+
+    # Execute the command with proxy env vars
+    local exit_code=0
+    log_verbose "Executing: ${command} ${args[*]:-}"
+    log_verbose "Proxy: http://127.0.0.1:${PROXY_PORT}"
+
+    # Export proxy env vars for child processes
+    export HTTPS_PROXY HTTP_PROXY all_proxy
+
+    "${command}" "${args[@]:-}" &
+    TARGET_PID=$!
+
+    # Wait for command to complete
+    wait "$TARGET_PID"
+    exit_code=$?
+
+    log_verbose "Command completed (exit code: ${exit_code})"
+
+    # Cleanup UDP limiting first (before proxy)
+    if [ -n "${UDP_INTERFACE}" ]; then
+        remove_udp_limit
+    fi
+    
+    # Cleanup proxy
+    cleanup_proxy
+
+    return "$exit_code"
+}
+
+# ============================================================
+# Main entry point
+# ============================================================
+
+main() {
+    # No arguments — show help
+    if [[ $# -eq 0 ]]; then
+        show_help
+        return 0
+    fi
+
+    # Parse arguments
+    local restore_mode=false
+    local positional=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help|-h)
+                show_help
+                return 0
+                ;;
+            --version)
+                show_version
+                return 0
+                ;;
+            --restore)
+                restore_mode=true
+                shift
+                ;;
+            --verbose|-v)
+                VERBOSE=true
+                shift
+                ;;
+            --dry-run|-n)
+                DRY_RUN=true
+                shift
+                ;;
+            --interface|-i)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "--interface requires an argument (e.g., en0)"
+                    return 1
+                fi
+                SPECIFIED_INTERFACE="$2"
+                shift 2
+                ;;
+            --udp-interface|-u)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "--udp-interface requires an argument (e.g., en0)"
+                    return 1
+                fi
+                UDP_INTERFACE="$2"
+                shift 2
+                ;;
+            --proxy-port)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "--proxy-port requires an argument (e.g., 8080)"
+                    return 1
+                fi
+                CUSTOM_PROXY_PORT="$2"
+                shift 2
+                ;;
+            -*)
+                # Check if it looks like a negative bandwidth value (e.g., -50%)
+                if [[ "$1" =~ ^-[0-9] ]]; then
+                    positional+=("$1")
+                    shift
+                else
+                    log_error "Unknown option: $1. Use --help for usage."
+                    return 1
+                fi
+                ;;
+            *)
+                positional+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    # Handle --restore
+    if $restore_mode; then
+        restore_rules
+        return 0
+    fi
+
+    # Need at least bandwidth_limit and command
+    if [[ ${#positional[@]} -lt 2 ]]; then
+        if [[ ${#positional[@]} -eq 1 ]]; then
+            log_error "Command is required. Usage: qos-guard <bandwidth_limit> <command> [args...]"
+        else
+            show_help
+        fi
+        return 1
+    fi
+
+    local bandwidth_limit="${positional[0]}"
+    local command="${positional[1]}"
+    local args=("${positional[@]:2}")
+
+    # Check command exists
+    if ! command -v "$command" >/dev/null 2>&1; then
+        log_error "Command not found: ${command}"
+        return 127
+    fi
+
+    # Dry-run mode (Phase 2: US-13)
+    if [ "$DRY_RUN" = true ]; then
+        echo "[dry-run] Would detect interface..."
+
+        # Validate bandwidth first
+        if ! validate_bandwidth "$bandwidth_limit" 2>/dev/null; then
+            log_error "Invalid bandwidth format: '${bandwidth_limit}'"
+            return 1
+        fi
+
+        # Simulate interface detection
+        local dry_run_iface=""
+        if [[ -n "$SPECIFIED_INTERFACE" ]]; then
+            dry_run_iface="$SPECIFIED_INTERFACE"
+            if ! ifconfig "$dry_run_iface" >/dev/null 2>&1; then
+                log_error "Interface '${dry_run_iface}' not found."
+                log_error "Available interfaces:"
+                ifconfig 2>/dev/null | grep '^en' | awk '{print "  " $1}'
+                return 1
+            fi
+        else
+            dry_run_iface="$(route get default 2>/dev/null | grep -i 'interface:' | awk -F': ' '{print $2}' | tr -d '[:space:]' || true)"
+            if [[ -z "$dry_run_iface" ]]; then
+                dry_run_iface="$(netstat -rn 2>/dev/null | grep '^default' | head -1 | awk '{print $NF}' || true)"
+            fi
+            if [[ -z "$dry_run_iface" ]]; then
+                for iface in en0 en1 en2 en3; do
+                    if ifconfig "$iface" >/dev/null 2>&1; then
+                        dry_run_iface="$iface"
+                        break
+                    fi
+                done
+            fi
+        fi
+
+        if [[ -z "$dry_run_iface" ]]; then
+            log_error "Could not detect a network interface."
+            return 1
+        fi
+
+        echo "[dry-run] Detected interface: ${dry_run_iface}"
+
+        # Simulate bandwidth detection
+        local dry_run_bw="100000"
+        local bw_output
+        bw_output="$(ifconfig "$dry_run_iface" 2>/dev/null | grep -E 'media:.*<' | grep -oE '[0-9]+[[:space:]]*[GM]bps' | head -1 | sed -E 's/[[:space:]]*/ /g' || true)"
+        if [[ -n "$bw_output" ]]; then
+            local number unit
+            number="$(echo "$bw_output" | sed 's/[^0-9.]//g')"
+            unit="$(echo "$bw_output" | grep -oE '[GM]bps' | head -1)"
+            case "$unit" in
+                Gbps) dry_run_bw="$(echo "$number * 1000000" | bc -l | sed 's/\..*$//')" ;;
+                Mbps) dry_run_bw="$(echo "$number * 1000" | bc -l | sed 's/\..*$//')" ;;
+            esac
+        fi
+        echo "[dry-run] Detected bandwidth: $((dry_run_bw / 1000)) Mbps"
+
+        # Simulate conversion
+        local dry_run_kbps=""
+        if [[ "$bandwidth_limit" =~ ^([0-9]+(\.[0-9]+)?)%$ ]]; then
+            local pct="${bandwidth_limit%%%}"
+            dry_run_kbps="$(echo "$dry_run_bw * $pct / 100" | bc -l | sed 's/\..*$//')"
+        elif [[ "$bandwidth_limit" =~ ^([0-9]+(\.[0-9]+)?)[Mm][Bb][Pp][Ss]$ ]]; then
+            local val="${bandwidth_limit%%[Mm][Bb][Pp][Ss]}"
+            dry_run_kbps="$(echo "$val * 1000" | bc -l | sed 's/\..*$//')"
+        elif [[ "$bandwidth_limit" =~ ^([0-9]+(\.[0-9]+)?)[Kk][Bb][Pp][Ss]$ ]]; then
+            local val="${bandwidth_limit%%[Kk][Bb][Pp][Ss]}"
+            dry_run_kbps="$(echo "$val" | bc -l | sed 's/\..*$//')"
+        fi
+        echo "[dry-run] Calculated limit (${bandwidth_limit}): ${dry_run_kbps} kbps"
+
+        # Generate a dry-run proxy port
+        local dry_run_port=0
+        if [[ -n "$CUSTOM_PROXY_PORT" ]]; then
+            dry_run_port="$CUSTOM_PROXY_PORT"
+        else
+            dry_run_port=$(( RANDOM % 10000 + 49152 ))
+        fi
+        echo "[dry-run] Proxy: qos-proxy -b 127.0.0.1:${dry_run_port} -l ${bandwidth_limit} -p all"
+        if [ -n "${UDP_INTERFACE}" ]; then
+            echo "[dry-run] UDP: pfctl limiting on ${UDP_INTERFACE} with ${bandwidth_limit}"
+        fi
+        echo "[dry-run] Would execute: ${command} ${args[*]:-}"
+
+        exit 0
+    fi
+
+    # Setup signal traps (Phase 2: US-8)
+    setup_signal_traps
+
+    # Execute with bandwidth limit
+    execute_command "$bandwidth_limit" "$command" "${args[@]:-}"
+}
+
+main "$@"
