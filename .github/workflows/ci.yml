@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+      fail-fast: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+
+      - name: Install bats-core (ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bats
+
+      - name: Install bats-core (macos)
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install bats-core
+
+      - name: Run BATS tests
+        run: |
+          bats tests/
+
+      - name: Build qos-proxy
+        run: |
+          go build ./qos-proxy/
+
+  homebrew:
+    name: Homebrew Validation
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Homebrew
+        run: |
+          brew install --only-deps homebrew/cask
+
+      - name: Install bats-core
+        run: |
+          brew install bats-core
+
+      - name: Run BATS tests
+        run: |
+          bats tests/
+
+      - name: Build qos-proxy
+        run: |
+          go build ./qos-proxy/
+
+      - name: Validate Homebrew formula
+        run: |
+          brew audit Formula/qos-guard.rb --strict

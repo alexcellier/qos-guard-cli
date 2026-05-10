@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+
+      - name: Install bats-core
+        run: |
+          brew install bats-core
+
+      - name: Run BATS tests
+        run: |
+          bats tests/
+
+      - name: Build qos-proxy for darwin/amd64
+        run: |
+          GOOS=darwin GOARCH=amd64 go build -o qos-proxy-darwin-amd64 ./qos-proxy/
+
+      - name: Build qos-proxy for darwin/arm64
+        run: |
+          GOOS=darwin GOARCH=arm64 go build -o qos-proxy-darwin-arm64 ./qos-proxy/
+
+      - name: Create checksums
+        run: |
+          shasum -a 256 qos-proxy-darwin-amd64 qos-proxy-darwin-arm64 > checksums.sha256
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            qos-proxy-darwin-amd64
+            qos-proxy-darwin-arm64
+            checksums.sha256
+          generate_release_notes: true

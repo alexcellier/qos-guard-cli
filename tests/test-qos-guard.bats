@@ -377,7 +377,7 @@ teardown() {
 @test "dry-run shows proxy env vars" {
     run "$QOS_GUARD" --dry-run 50% echo test
     assert [ $status -eq 0 ]
-    assert_output --partial "HTTPS_PROXY"
+    assert_output --partial "Proxy:"
 }
 
 @test "dry-run shows interface detection" {

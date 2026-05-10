@@ -122,12 +122,17 @@ cp qos-proxy/qos-proxy /usr/local/bin/qos-proxy
 chmod +x /usr/local/bin/qos-proxy
 ```
 
-### Option 3: Homebrew
+### Option 3: Homebrew (Custom Tap)
 
 ```bash
 brew tap alexcellier/homebrew-qos-guard
 brew install qos-guard
 ```
+
+> **Note:** The homebrew-core submission is pending approval. Once approved, installation will be:
+> ```bash
+> brew install qos-guard
+> ```
 
 ## Prerequisites
 

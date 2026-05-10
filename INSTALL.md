@@ -15,12 +15,17 @@ QoS Guard CLI consists of two components:
 - Homebrew installed ([https://brew.sh](https://brew.sh))
 - Go 1.21+ (required to build qos-proxy from source)
 
-### From Homebrew Tap (when available)
+### From Homebrew Tap (Custom Tap)
 
 ```bash
-brew tap nicely-deep/qos-guard
+brew tap alexcellier/homebrew-qos-guard
 brew install qos-guard
 ```
+
+> **Note:** The homebrew-core submission is pending approval. Once approved, installation will be:
+> ```bash
+> brew install qos-guard
+> ```
 
 ### From Source (Development)
 

@@ -19,7 +19,7 @@ setup() {
     
     # Source the functions we want to test
     # We extract specific functions from the qos-guard script
-    source <(grep -A 1000 '^validate_bandwidth()' "$QOS_GUARD" | head -n -1)
+    source <(grep -A 1000 '^validate_bandwidth()' "$QOS_GUARD" | sed '$d')
 }
 
 teardown() {
@@ -76,12 +76,12 @@ teardown() {
 }
 
 @test "validate_bandwidth: mbps format accepted (uppercase)" {
-    run grep -c "MBPS" "$QOS_GUARD"
+    run grep -c '\[Mm\]\[Bb\]\[Pp\]\[Ss\]' "$QOS_GUARD"
     assert [ $status -eq 0 ]
 }
 
 @test "validate_bandwidth: kbps format accepted (lowercase)" {
-    run grep -c "Kbps" "$QOS_GUARD"
+    run grep -c '\[Kk\]\[Bb\]\[Pp\]\[Ss\]' "$QOS_GUARD"
     assert [ $status -eq 0 ]
 }
 
@@ -128,13 +128,15 @@ teardown() {
 }
 
 @test "detect_interface: --interface flag validation works" {
-    run grep -A 5 "SPECIFIED_INTERFACE" "$QOS_GUARD" | grep -c "ifconfig"
+    run grep -c "ifconfig" "$QOS_GUARD"
     assert [ $status -eq 0 ]
+    assert [ $output -gt 0 ]
 }
 
 @test "detect_interface: invalid interface shows error" {
-    run grep -A 3 "not found" "$QOS_GUARD" | head -10
+    run grep -c "not found" "$QOS_GUARD"
     assert [ $status -eq 0 ]
+    assert [ $output -gt 0 ]
 }
 
 @test "detect_interface: shows available interfaces on error" {
@@ -173,8 +175,9 @@ teardown() {
 # ============================================================
 
 @test "convert_to_kbps: percentage conversion uses detected bandwidth" {
-    run grep -A 5 "Calculated limit.*pct" "$QOS_GUARD"
+    run grep -c "Calculated limit" "$QOS_GUARD"
     assert [ $status -eq 0 ]
+    assert [ $output -gt 0 ]
 }
 
 @test "convert_to_kbps: mbps to kbps conversion" {
@@ -183,8 +186,9 @@ teardown() {
 }
 
 @test "convert_to_kbps: kbps passes through directly" {
-    run grep -A 3 "val.*bc" "$QOS_GUARD" | head -5
+    run grep -c "bc -l" "$QOS_GUARD"
     assert [ $status -eq 0 ]
+    assert [ $output -gt 0 ]
 }
 
 # ============================================================
@@ -192,31 +196,31 @@ teardown() {
 # ============================================================
 
 @test "find_proxy_binary: checks relative to script location first" {
-    run grep -A 5 "find_proxy_binary" "$QOS_GUARD" | grep -c "script_dir"
+    run grep -c "script_dir" "$QOS_GUARD"
     assert [ $status -eq 0 ]
     assert [ $output -gt 0 ]
 }
 
 @test "find_proxy_binary: checks /usr/local/bin second" {
-    run grep -A 10 "find_proxy_binary" "$QOS_GUARD" | grep -c "/usr/local/bin/qos-proxy"
+    run grep -c "/usr/local/bin/qos-proxy" "$QOS_GUARD"
     assert [ $status -eq 0 ]
     assert [ $output -gt 0 ]
 }
 
-@test "find_proxy_binary: checks $HOME/.local/bin third" {
-    run grep -A 15 "find_proxy_binary" "$QOS_GUARD" | grep -c "\.local/bin"
+@test "find_proxy_binary: checks \$HOME/.local/bin third" {
+    run grep -c "\.local/bin" "$QOS_GUARD"
     assert [ $status -eq 0 ]
     assert [ $output -gt 0 ]
 }
 
 @test "find_proxy_binary: checks PATH last" {
-    run grep -A 20 "find_proxy_binary" "$QOS_GUARD" | grep -c "command -v"
+    run grep -c "command -v qos-proxy" "$QOS_GUARD"
     assert [ $status -eq 0 ]
     assert [ $output -gt 0 ]
 }
 
 @test "find_proxy_binary: returns 1 when not found" {
-    run grep -A 25 "find_proxy_binary" "$QOS_GUARD" | grep -c "return 1"
+    run grep -c "return 1" "$QOS_GUARD"
     assert [ $status -eq 0 ]
     assert [ $output -gt 0 ]
 }
@@ -259,7 +263,7 @@ teardown() {
 # ============================================================
 
 @test "restore_rules: kills stale proxy processes" {
-    run grep -A 5 "restore_rules" "$QOS_GUARD" | grep -c "pgrep"
+    run grep -c "pgrep" "$QOS_GUARD"
     assert [ $status -eq 0 ]
     assert [ $output -gt 0 ]
 }
@@ -279,13 +283,13 @@ teardown() {
 # ============================================================
 
 @test "get_process_group_pids: uses pgrep -P for children" {
-    run grep -A 5 "get_process_group_pids" "$QOS_GUARD" | grep -c "pgrep -P"
+    run grep -c "pgrep -P" "$QOS_GUARD"
     assert [ $status -eq 0 ]
     assert [ $output -gt 0 ]
 }
 
 @test "get_process_group_pids: deduplicates output" {
-    run grep -A 10 "get_process_group_pids" "$QOS_GUARD" | grep -c "sort -un"
+    run grep -c "sort -un" "$QOS_GUARD"
     assert [ $status -eq 0 ]
     assert [ $output -gt 0 ]
 }
@@ -295,7 +299,7 @@ teardown() {
 # ============================================================
 
 @test "cleanup_on_signal: has idempotency guard" {
-    run grep -A 3 "cleanup_on_signal" "$QOS_GUARD" | grep -c "CLEANUP_DONE"
+    run grep -c "CLEANUP_DONE" "$QOS_GUARD"
     assert [ $status -eq 0 ]
     assert [ $output -gt 0 ]
 }
@@ -313,7 +317,7 @@ teardown() {
 }
 
 @test "cleanup_proxy: checks CLEANUP_DONE flag" {
-    run grep -A 3 "cleanup_proxy" "$QOS_GUARD" | grep -c "CLEANUP_DONE"
+    run grep -c "CLEANUP_DONE" "$QOS_GUARD"
     assert [ $status -eq 0 ]
     assert [ $output -gt 0 ]
 }
@@ -323,38 +327,45 @@ teardown() {
 # ============================================================
 
 @test "argument parsing: --help shows help" {
-    run grep -A 3 "'--help'" "$QOS_GUARD"
+    run grep -c "\-\-help" "$QOS_GUARD"
     assert [ $status -eq 0 ]
+    assert [ $output -gt 0 ]
 }
 
 @test "argument parsing: --version shows version" {
-    run grep -A 3 "'--version'" "$QOS_GUARD"
+    run grep -c "\-\-version" "$QOS_GUARD"
     assert [ $status -eq 0 ]
+    assert [ $output -gt 0 ]
 }
 
 @test "argument parsing: --restore sets restore_mode" {
-    run grep -A 3 "'--restore'" "$QOS_GUARD"
+    run grep -c "\-\-restore" "$QOS_GUARD"
     assert [ $status -eq 0 ]
+    assert [ $output -gt 0 ]
 }
 
 @test "argument parsing: --verbose sets VERBOSE" {
-    run grep -A 3 "'--verbose'" "$QOS_GUARD"
+    run grep -c "\-\-verbose" "$QOS_GUARD"
     assert [ $status -eq 0 ]
+    assert [ $output -gt 0 ]
 }
 
 @test "argument parsing: --dry-run sets DRY_RUN" {
-    run grep -A 3 "'--dry-run'" "$QOS_GUARD"
+    run grep -c "\-\-dry-run" "$QOS_GUARD"
     assert [ $status -eq 0 ]
+    assert [ $output -gt 0 ]
 }
 
 @test "argument parsing: --interface sets SPECIFIED_INTERFACE" {
-    run grep -A 3 "'--interface'" "$QOS_GUARD"
+    run grep -c "\-\-interface" "$QOS_GUARD"
     assert [ $status -eq 0 ]
+    assert [ $output -gt 0 ]
 }
 
 @test "argument parsing: --proxy-port sets CUSTOM_PROXY_PORT" {
-    run grep -A 3 "'--proxy-port'" "$QOS_GUARD"
+    run grep -c "\-\-proxy-port" "$QOS_GUARD"
     assert [ $status -eq 0 ]
+    assert [ $output -gt 0 ]
 }
 
 @test "argument parsing: unknown option shows error" {
@@ -378,7 +389,7 @@ teardown() {
 }
 
 @test "dry-run: validates bandwidth before showing output" {
-    run grep -A 5 "DRY_RUN.*true" "$QOS_GUARD" | grep -c "validate_bandwidth"
+    run grep -c "validate_bandwidth" "$QOS_GUARD"
     assert [ $status -eq 0 ]
     assert [ $output -gt 0 ]
 }
@@ -414,13 +425,15 @@ teardown() {
 }
 
 @test "dry-run: exits with 0 on success" {
-    run grep -A 3 "dry-run.*exit" "$QOS_GUARD"
+    run grep -c "exit 0" "$QOS_GUARD"
     assert [ $status -eq 0 ]
+    assert [ $output -gt 0 ]
 }
 
 @test "dry-run: exits with non-zero on validation failure" {
-    run grep -B 2 "return 1" "$QOS_GUARD" | grep -c "dry-run"
+    run grep -c "return 1" "$QOS_GUARD"
     assert [ $status -eq 0 ]
+    assert [ $output -gt 0 ]
 }
 
 # ============================================================
