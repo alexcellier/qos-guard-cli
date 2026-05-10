@@ -100,8 +100,8 @@ QoS Guard is useful for:
 ### Option 1: Install via Make
 
 ```bash
-git clone https://github.com/yourusername/CLI-QoS.git
-cd CLI-QoS
+git clone https://github.com/alexcellier/qos-guard-cli.git
+cd qos-guard-cli
 make install
 ```
 
@@ -122,10 +122,11 @@ cp qos-proxy/qos-proxy /usr/local/bin/qos-proxy
 chmod +x /usr/local/bin/qos-proxy
 ```
 
-### Option 3: Homebrew (coming soon)
+### Option 3: Homebrew
 
 ```bash
-brew install yourusername/tap/qos-guard
+brew tap alexcellier/homebrew-qos-guard
+brew install qos-guard
 ```
 
 ## Prerequisites

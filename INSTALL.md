@@ -1,8 +1,8 @@
-# CLI-QoS Installation Guide
+# QoS Guard CLI Installation Guide
 
 ## Overview
 
-CLI-QoS consists of two components:
+QoS Guard CLI consists of two components:
 
 - **qos-guard** — A shell script CLI tool for per-process bandwidth limiting
 - **qos-proxy** — A Go binary that provides HTTP/HTTPS/SOCKS5 proxy with rate limiting
@@ -29,8 +29,8 @@ brew install qos-guard
 brew install go
 
 # Clone the repository
-git clone https://github.com/nicely-deep/CLI-QoS.git
-cd CLI-QoS
+git clone https://github.com/alexcellier/qos-guard-cli.git
+cd qos-guard-cli
 
 # Install from local formula
 brew install ./Formula/qos-guard.rb
